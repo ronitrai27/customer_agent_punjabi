@@ -1,4 +1,5 @@
 import os
+import re
 import logging
 import json
 import asyncio
@@ -15,6 +16,10 @@ from src.app.services.db_service import db_service
 from src.app.services.semantic_cache_service import semantic_cache_service
 from src.app.services.translation_service import translation_service
 from src.app.services.deepeval_server_evaluator import trigger_live_deepeval
+try:
+    from src.app.core.guardrail_service import AgentGuardrailService
+except ImportError:
+    from app.core.guardrail_service import AgentGuardrailService
 
 logger = logging.getLogger("AgentChatApi")
 router = APIRouter(
@@ -330,6 +335,8 @@ async def chat_stream_endpoint(req: ChatRequest):
     async def process_stream_events(stream_iterator):
         reasoning_sent = False
         last_status = ""
+        logged_nodes = set()
+        logged_tools = set()
 
         async for event in stream_iterator:
             kind = event.get("event")
@@ -337,8 +344,16 @@ async def chat_stream_endpoint(req: ChatRequest):
             event_name = event.get("name", "")
             target = node_name or event_name
 
-            # Emit real-time status updates as graph nodes & chains begin
+            # Emit real-time status updates & console logs as graph nodes & subagents begin
             if kind in ["on_chain_start", "on_node_start"]:
+                if node_name and node_name not in logged_nodes:
+                    logged_nodes.add(node_name)
+                    logger.info(f"👉 AGENT CALLED: {node_name}")
+                    print(f"\n==========================================", flush=True)
+                    print(f"👉 AGENT CALLED: {node_name}", flush=True)
+                    print(f"==========================================\n", flush=True)
+                    yield f"data: {json.dumps({'type': 'agent_call', 'agent': node_name, 'content': f'{node_name} called'})}\n\n"
+
                 status_msg = None
                 if target == "supervisor_router":
                     status_msg = "Analyzing query intent & checking workflow routing..."
@@ -350,6 +365,12 @@ async def chat_stream_endpoint(req: ChatRequest):
                     status_msg = "Processing support ticket & reviewing inquiries..."
                 elif target == "deep_memory_node":
                     status_msg = "Consulting user memory & historical farmer facts..."
+                elif target == "web_search_fanout":
+                    status_msg = "Decomposing query into 3 parallel search perspectives..."
+                elif target == "web_search_worker":
+                    status_msg = "Executing parallel Tavily web search..."
+                elif target == "critic_agent":
+                    status_msg = "Critic Agent evaluating, de-duplicating & verifying web facts..."
                 elif target == "supervisor_sales_agent":
                     status_msg = "Consulting agricultural knowledge base & composing response..."
 
@@ -359,6 +380,12 @@ async def chat_stream_endpoint(req: ChatRequest):
 
             if kind == "on_tool_start":
                 tool_name = event.get("name", "")
+                if tool_name and tool_name not in logged_tools:
+                    logged_tools.add(tool_name)
+                    logger.info(f"🛠️ TOOL CALLED: {tool_name}")
+                    print(f"🛠️ TOOL CALLED: {tool_name}", flush=True)
+                    yield f"data: {json.dumps({'type': 'tool_call', 'tool': tool_name, 'content': f'{tool_name} called'})}\n\n"
+
                 status_msg = None
                 if tool_name in ["run_rag_agent", "retrieval_service"]:
                     status_msg = "Searching vector database & embedding documents..."
@@ -372,15 +399,22 @@ async def chat_stream_endpoint(req: ChatRequest):
                     yield f"data: {json.dumps({'type': 'status', 'content': status_msg})}\n\n"
 
             if kind == "on_chat_model_stream":
-                if node_name == "supervisor_router":
+                # Only stream tokens from the final response generator (supervisor_sales_agent)
+                if node_name != "supervisor_sales_agent":
                     continue
                 chunk = event.get("data", {}).get("chunk")
                 if chunk and hasattr(chunk, "content"):
                     token = chunk.content
                     if token and isinstance(token, str):
                         yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
-            elif kind in ["on_chat_model_end", "on_chain_end"]:
-                if node_name == "supervisor_router" and not reasoning_sent:
+            elif kind in ["on_chat_model_end", "on_chain_end", "on_node_end"]:
+                if node_name == "web_search_fanout":
+                    output = event.get("data", {}).get("output")
+                    if isinstance(output, dict) and "web_search_queries" in output:
+                        queries = output.get("web_search_queries", [])
+                        if queries and isinstance(queries, list):
+                            yield f"data: {json.dumps({'type': 'web_search_queries', 'queries': queries})}\n\n"
+                elif node_name == "supervisor_router" and not reasoning_sent:
                     output = event.get("data", {}).get("output")
                     reasoning = extract_reasoning(output)
                     if reasoning:
@@ -427,10 +461,34 @@ async def chat_stream_endpoint(req: ChatRequest):
                     yield f"data: {json.dumps({'type': 'error', 'error': 'Message cannot be empty.'})}\n\n"
                     return
 
-                # Fast check in Semantic Cache
-                cached_data = await semantic_cache_service.get_cached_response(req.user_id, req.message)
-                if cached_data:
+                # NeMo Guardrails Input Validation & PII Redaction
+                guardrail_svc = AgentGuardrailService.get_instance()
+                is_safe, sanitized_input, refusal_reason = await guardrail_svc.validate_input(req.message)
+
+                if not is_safe:
+                    logger.warning(f"[GUARDRAIL BLOCKED] Thread {req.thread_id} | User {req.user_id}: {req.message}")
+                    refusal_text = refusal_reason or "I cannot process this request because it violates safety policies and security rules."
                     save_user_message(req.thread_id, req.user_id, req.message)
+                    save_assistant_message(req.thread_id, refusal_text)
+                    
+                    yield f"data: {json.dumps({'type': 'error', 'error': refusal_text})}\n\n"
+                    yield f"data: {json.dumps({'type': 'token', 'content': refusal_text})}\n\n"
+                    payload = {
+                        "type": "completed",
+                        "status": "completed",
+                        "response": refusal_text,
+                        "thread_id": req.thread_id,
+                        "guardrail_blocked": True
+                    }
+                    yield f"data: {json.dumps(payload)}\n\n"
+                    return
+
+                user_message_to_process = sanitized_input
+
+                # Fast check in Semantic Cache
+                cached_data = await semantic_cache_service.get_cached_response(req.user_id, user_message_to_process)
+                if cached_data:
+                    save_user_message(req.thread_id, req.user_id, user_message_to_process)
                     save_assistant_message(req.thread_id, cached_data["response"])
                     yield f"data: {json.dumps({'type': 'reasoning', 'content': 'Retrieved instantly from 7-day Semantic Cache.'})}\n\n"
                     yield f"data: {json.dumps({'type': 'token', 'content': cached_data['response']})}\n\n"
@@ -444,13 +502,13 @@ async def chat_stream_endpoint(req: ChatRequest):
                     yield f"data: {json.dumps(payload)}\n\n"
                     return
 
-                save_user_message(req.thread_id, req.user_id, req.message)
+                save_user_message(req.thread_id, req.user_id, user_message_to_process)
                 
                 # Fetch slim, lightweight user core memory context
                 user_profile = get_slim_user_profile(req.user_id)
 
                 initial_state = {
-                    "messages": [HumanMessage(content=req.message)],
+                    "messages": [HumanMessage(content=user_message_to_process)],
                     "user_id": req.user_id,
                     "user_profile": user_profile,
                     "internal_facts": [],
@@ -484,29 +542,44 @@ async def chat_stream_endpoint(req: ChatRequest):
                     if msg.type == "ai"
                 ]
                 reply = assistant_messages[-1] if assistant_messages else "I couldn't process your request."
-                save_assistant_message(req.thread_id, reply)
+
+                # Extract and strip <suggested_actions> tag if present
+                suggested_actions = new_state.values.get("suggested_actions") or []
+                if not suggested_actions and reply:
+                    match = re.search(r"<suggested_actions>\s*(.*?)\s*</suggested_actions>", reply, re.DOTALL)
+                    if match:
+                        lines = match.group(1).strip().split("\n")
+                        for l in lines:
+                            cleaned_act = re.sub(r"^\s*[-*\d.]+\s*", "", l).strip()
+                            if cleaned_act:
+                                suggested_actions.append(cleaned_act)
+                        suggested_actions = suggested_actions[:3]
+
+                clean_reply = re.sub(r"<suggested_actions>\s*.*?\s*</suggested_actions>", "", reply, flags=re.DOTALL).strip()
+                save_assistant_message(req.thread_id, clean_reply)
                 
                 # Store in 7-day Semantic Cache (reusing rag_dense_vec from RAG with 0 extra API calls)
-                if req.approve is None and reply:
+                if req.approve is None and clean_reply:
                     rag_dense_vec = None
                     for item in new_state.values.get("internal_facts", []):
                         if isinstance(item, dict) and item.get("subagent") == "rag_agent":
                             rag_dense_vec = item.get("rag_dense_vec")
                             break
                     await semantic_cache_service.set_cached_response(
-                        req.user_id, req.message, reply, dense_vec=rag_dense_vec
+                        req.user_id, req.message, clean_reply, dense_vec=rag_dense_vec
                     )
 
                 # Trigger background memory check if message count is a multiple of 3
                 await trigger_background_memory_workflow(req.user_id, req.thread_id)
                 
                 # Trigger background DeepEval metrics evaluation (0 added latency)
-                trigger_live_deepeval(req.message, reply, new_state.values)
+                trigger_live_deepeval(req.message, clean_reply, new_state.values)
 
                 payload = {
                     "type": "completed",
                     "status": "completed",
-                    "response": reply,
+                    "response": clean_reply,
+                    "suggested_actions": suggested_actions,
                     "thread_id": req.thread_id
                 }
                 yield f"data: {json.dumps(payload)}\n\n"

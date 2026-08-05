@@ -1,15 +1,19 @@
 import os
 import json
 import logging
-from typing import Dict, Any
+import re
+from typing import Dict, Any, List
 from pydantic import BaseModel, Field
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
 from langgraph.graph import StateGraph, END
+from langgraph.types import Send
 
 from src.app.graphs.rag_agent import run_rag_agent
+from src.app.graphs.web_search_agent import web_search_fanout, route_web_search_fanout, web_search_worker, critic_agent
 from src.app.tools.booking_tools import create_booking, get_booking_updates
 from src.app.tools.query_tools import create_query, get_user_queries
+from src.app.tools.web_search_tools import execute_tavily_search
 from src.app.core.config import settings
 from src.app.graphs.state import SupervisorState
 from src.app.services.retrieval_service import retrieval_service
@@ -36,7 +40,7 @@ query_llm = sub_agent_llm.bind_tools([create_query, get_user_queries])
 # -----------------------------------------------------------------------------
 class SupervisorDecision(BaseModel):
     action_type: str = Field(
-        description="Next node to route to: 'RAG_SEARCH' (for questions about catalog products, milk yield, fat %, ingredients, dosage), 'BOOKING_NODE' (for ordering/booking products or checking booking history/updates), 'QUERY_NODE' (for creating support tickets/callbacks or checking user support tickets), 'DEEP_MEMORY' (when user asks about their past history, memory, previous purchases, or stored cattle/farmer profile facts), or 'NONE' (greetings, standard chit-chat, general topics)."
+        description="Next node to route to: 'RAG_SEARCH' (for questions about catalog products, milk yield, fat %, ingredients, dosage), 'BOOKING_NODE' (for ordering/booking products or checking booking history/updates), 'QUERY_NODE' (for creating support tickets/callbacks or checking user support tickets), 'DEEP_MEMORY' (when user asks about past history, memory, previous purchases, or stored cattle/farmer profile facts), 'WEB_SEARCH' (for external web queries, current milk/commodity market prices, dairy industry news, or general scientific studies outside internal catalog), or 'NONE' (greetings, standard chit-chat, general topics)."
     )
     reasoning: str = Field(description="Reasoning for decision.")
 
@@ -50,12 +54,13 @@ Analyze the user's message and history to classify the next action:
 2. Place a product order/booking, check order/booking updates/history -> action_type = "BOOKING_NODE" (routes to booking_node)
 3. Create a support ticket/query/callback request, check existing support tickets -> action_type = "QUERY_NODE" (routes to query_node)
 4. User asks about their past interactions, past memory, stored farmer/cattle profile, previous recommendations, or order history -> action_type = "DEEP_MEMORY" (routes to deep_memory_node)
-5. Greetings, general chit-chat, or general sales discussion -> action_type = "NONE" (routes directly to sales agent)
+5. General web queries, current raw milk or grain commodity prices, general livestock market news, or scientific studies outside internal catalog -> action_type = "WEB_SEARCH" (routes to web_search_fanout)
+6. Greetings, general chit-chat, or general sales discussion -> action_type = "NONE" (routes directly to sales agent)
 """
 
 
 async def supervisor_router(state: SupervisorState) -> Dict[str, Any]:
-    """Decides if we route to RAG Sub-Agent, Booking Node, Query Node, Deep Memory Node, or Supervisor Sales Agent."""
+    """Decides if we route to RAG Sub-Agent, Booking Node, Query Node, Deep Memory Node, Web Search Fanout, or Supervisor Sales Agent."""
     messages = state.get("messages", [])
 
     try:
@@ -82,6 +87,8 @@ async def supervisor_router(state: SupervisorState) -> Dict[str, Any]:
             next_node = "query_node"
         elif decision.action_type == "DEEP_MEMORY":
             next_node = "deep_memory_node"
+        elif decision.action_type == "WEB_SEARCH":
+            next_node = "web_search_fanout"
         else:
             next_node = "supervisor_sales_agent"
 
@@ -454,7 +461,7 @@ async def deep_memory_node(state: SupervisorState) -> Dict[str, Any]:
 
 
 # -----------------------------------------------------------------------------
-# 4. Supervisor Sales Agent Node (Streams Final Answer to User)
+# 5. Supervisor Sales Agent Node (Streams Final Answer to User)
 # -----------------------------------------------------------------------------
 SALES_PROMPT = """
 You are VRSA AGROTECH's Lead Animal Nutrition & Product Sales Specialist.
@@ -469,11 +476,20 @@ CATALOG SUMMARY:
 - Buffalo-F 1.5X: Target fat-enrichment formula (1.5X power) for buffalo milk density & fat %.
 
 MANDATE & GROUNDING RULES:
---> Always ground product facts and recommendations using facts retrieved by the rag_agent sub-agent and catalog knowledge (use only when required for grounded results)
+--> Always ground product facts and recommendations using facts retrieved by the rag_agent sub-agent and catalog knowledge.
+--> Always ground verified external web research using facts provided by the critic_agent.
 --> Always leverage user history retrieved by the deep_memory_node whenever deeper context is needed to deliver a personalized response.
-1. Grounded & Adequate Facts: ALWAYS ground product claims, ingredients, dosages (e.g. 50g-100g daily in feed), micro-nutrients (chelated minerals, bypass fats, vitamins, probiotics), and species benefits directly in RAG retrieved facts and catalog knowledge. Provide precise, fully adequate, grounded information.
-2. Sales & Booking CTA: Recommend the optimal product based on farmer needs (low yield, low fat %, post-calving). Explain financial ROI (higher milk yield/fat = higher daily payout) and naturally invite them to book the order right away.
-3. Integration: Seamlessly synthesize RAG retrieved facts, Deep Memory facts, and Tool execution results into a warm, professional response in English.
+1. Grounded & Adequate Facts: ALWAYS ground product claims, ingredients, dosages, and species benefits directly in internal data facts and catalog knowledge.
+2. Sales & Booking CTA: Recommend the optimal product based on farmer needs. Explain financial ROI and naturally invite them to book the order.
+3. Integration: Seamlessly synthesize RAG retrieved facts, Critic Agent verified web facts, Deep Memory facts, and Tool execution results.
+
+SUGGESTED ACTIONS MANDATE:
+At the very end of your response, on a new line, provide exactly 1 to 3 relevant follow-up action suggestions for the user wrapped in XML tags like this:
+<suggested_actions>
+- Ask about product dosage
+- Check TrioSan Gold pricing
+- Book Horsa-550X-Turbo order
+</suggested_actions>
 """
 
 
@@ -514,6 +530,11 @@ async def supervisor_sales_agent(state: SupervisorState) -> Dict[str, Any]:
                 sums = item.get("summaries", [])
                 if sums:
                     facts_str += "Past Summaries:\n" + "\n".join([f"- {s}" for s in sums]) + "\n"
+            elif item.get("subagent") == "critic_agent":
+                facts_str += f"\n[Critic Agent Verified Web Facts]:\n{item.get('verified_web_facts')}\n"
+                cits = item.get("citations", [])
+                if cits:
+                    facts_str += "Citations:\n" + "\n".join([f"- [{c.get('title')}]({c.get('url')})" for c in cits]) + "\n"
             elif "tool" in item:
                 facts_str += f"\n[Sub-Agent Tool Result ({item.get('subagent')})]: {json.dumps(item)}"
             else:
@@ -534,7 +555,24 @@ async def supervisor_sales_agent(state: SupervisorState) -> Dict[str, Any]:
     response = await llm_circuit_breaker.execute(
         primary_sales_call, fallback_sales_call, context_name="Supervisor Sales Agent"
     )
-    return {"messages": [response], "next": "__end__"}
+
+    # Parse suggested_actions if present in response
+    suggested_actions = []
+    if response and hasattr(response, "content") and isinstance(response.content, str):
+        match = re.search(r"<suggested_actions>\s*(.*?)\s*</suggested_actions>", response.content, re.DOTALL)
+        if match:
+            lines = match.group(1).strip().split("\n")
+            for l in lines:
+                cleaned = re.sub(r"^\s*[-*\d.]+\s*", "", l).strip()
+                if cleaned:
+                    suggested_actions.append(cleaned)
+            suggested_actions = suggested_actions[:3]
+
+    return {
+        "messages": [response],
+        "suggested_actions": suggested_actions,
+        "next": "__end__"
+    }
 
 
 # -----------------------------------------------------------------------------
@@ -550,6 +588,9 @@ workflow.add_node("query_node", query_node)
 workflow.add_node("query_agent", run_query_agent)
 workflow.add_node("query_read_agent", run_query_read_agent)
 workflow.add_node("deep_memory_node", deep_memory_node)
+workflow.add_node("web_search_fanout", web_search_fanout)
+workflow.add_node("web_search_worker", web_search_worker)
+workflow.add_node("critic_agent", critic_agent)
 workflow.add_node("supervisor_sales_agent", supervisor_sales_agent)
 
 workflow.set_entry_point("supervisor_router")
@@ -564,6 +605,7 @@ workflow.add_conditional_edges("supervisor_router", route_next, {
     "booking_node": "booking_node",
     "query_node": "query_node",
     "deep_memory_node": "deep_memory_node",
+    "web_search_fanout": "web_search_fanout",
     "supervisor_sales_agent": "supervisor_sales_agent"
 })
 
@@ -579,12 +621,16 @@ workflow.add_conditional_edges("query_node", route_next, {
     "__end__": END
 })
 
+workflow.add_conditional_edges("web_search_fanout", route_web_search_fanout, ["web_search_worker"])
+
 workflow.add_edge("rag_agent", "supervisor_sales_agent")
 workflow.add_edge("booking_agent", "supervisor_sales_agent")
 workflow.add_edge("booking_read_agent", "supervisor_sales_agent")
 workflow.add_edge("query_agent", "supervisor_sales_agent")
 workflow.add_edge("query_read_agent", "supervisor_sales_agent")
 workflow.add_edge("deep_memory_node", "supervisor_sales_agent")
+workflow.add_edge("web_search_worker", "critic_agent")
+workflow.add_edge("critic_agent", "supervisor_sales_agent")
 workflow.add_edge("supervisor_sales_agent", END)
 
 from langgraph.checkpoint.memory import MemorySaver

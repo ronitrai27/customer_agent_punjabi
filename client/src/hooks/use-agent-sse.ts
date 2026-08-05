@@ -8,9 +8,11 @@ export interface Message {
   timestamp: string;
   reasoning?: string;
   statusText?: string;
+  searchQueries?: string[];
   duration?: number;
   approvalCard?: PendingApproval;
   memoryUpdated?: boolean;
+  suggestedActions?: string[];
 }
 
 export interface PendingApproval {
@@ -140,6 +142,14 @@ export function useAgentSSE(threadId: string, userId: string) {
                       : msg,
                   ),
                 );
+              } else if (data.type === "web_search_queries") {
+                setMessages((prev) =>
+                  prev.map((msg) =>
+                    msg.id === assistantMessageId
+                      ? { ...msg, searchQueries: data.queries }
+                      : msg,
+                  ),
+                );
               } else if (data.type === "reasoning") {
                 if (!reasoningStartTime) {
                   reasoningStartTime = Date.now();
@@ -195,7 +205,12 @@ export function useAgentSSE(threadId: string, userId: string) {
                 setMessages((prev) =>
                   prev.map((msg) =>
                     msg.id === assistantMessageId
-                      ? { ...msg, content: data.response, duration }
+                      ? {
+                          ...msg,
+                          content: data.response,
+                          duration,
+                          suggestedActions: data.suggested_actions,
+                        }
                       : msg,
                   ),
                 );

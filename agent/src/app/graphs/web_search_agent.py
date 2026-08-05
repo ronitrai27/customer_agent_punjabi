@@ -1,0 +1,168 @@
+import os
+import json
+import logging
+from typing import Dict, Any, List
+from pydantic import BaseModel, Field
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import SystemMessage
+from langgraph.types import Send
+
+from src.app.core.config import settings
+from src.app.graphs.state import SupervisorState
+from src.app.tools.web_search_tools import execute_tavily_search
+
+logger = logging.getLogger("WebSearchAgent")
+
+sub_agent_model = "gpt-4.1-mini"
+sub_agent_llm = ChatOpenAI(model=sub_agent_model, temperature=0.2, api_key=settings.OPENAI_API_KEY)
+
+
+class QueryDecomposition(BaseModel):
+    queries: List[str] = Field(
+        description="Exactly 3 distinct search queries expressing the user's core request from 3 different perspectives (e.g. 1. Direct factual, 2. Industry/scientific domain, 3. Practical market/use-case)."
+    )
+
+
+def web_search_fanout(state: SupervisorState):
+    """
+    Decomposes the user query into 3 distinct search perspectives and uses Send() to execute 3 parallel web search worker nodes.
+    """
+    messages = state.get("messages", [])
+    last_user_query = ""
+    for msg in reversed(messages):
+        if hasattr(msg, "type") and msg.type == "human":
+            last_user_query = msg.content
+            break
+        elif isinstance(msg, dict) and msg.get("role") == "user":
+            last_user_query = msg.get("content", "")
+            break
+
+    if not last_user_query:
+        last_user_query = "latest dairy farming and livestock market trends"
+
+    print("\n" + "=" * 80)
+    print(f"[WEB SEARCH AGENT] STEP 1: EXTRACTED USER QUERY -> '{last_user_query}'")
+
+    decomp_prompt = (
+        f"You are a Search Query Architect for Vrsa Agrotech.\n"
+        f"User query: '{last_user_query}'\n"
+        f"Generate exactly 3 distinct search query strings to query the web in parallel:\n"
+        f"1. Factual / Direct Query\n"
+        f"2. Scientific / Technical Domain Query\n"
+        f"3. Practical Market / Farmer Use-case Query"
+    )
+
+    try:
+        structured_llm = sub_agent_llm.with_structured_output(QueryDecomposition)
+        res: QueryDecomposition = structured_llm.invoke([SystemMessage(content=decomp_prompt)])
+        queries = res.queries[:3]
+        if len(queries) < 3:
+            queries.extend([last_user_query] * (3 - len(queries)))
+    except Exception as e:
+        logger.error(f"[WEB SEARCH AGENT] Query decomposition error: {e}")
+        queries = [last_user_query, f"{last_user_query} research trends", f"{last_user_query} market price"]
+
+    print("[WEB SEARCH AGENT] STEP 2: 3 PARALLEL WORKER QUERIES GENERATED (Send()):")
+    for idx, q in enumerate(queries, 1):
+        print(f"   Worker #{idx}: '{q}'")
+    print("=" * 80 + "\n")
+
+    return {"web_search_queries": queries}
+
+
+def route_web_search_fanout(state: SupervisorState) -> List[Send]:
+    """
+    Conditional edge router exiting web_search_fanout node.
+    Spawns 3 parallel web_search_worker nodes using Send().
+    """
+    queries = state.get("web_search_queries", [])
+    if not queries:
+        queries = ["latest AI technology 2026"]
+    return [Send("web_search_worker", {"query": q}) for q in queries]
+
+
+async def web_search_worker(state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Parallel worker node that executes Tavily web search for a single query perspective.
+    Appends search results into web_search_raw_results via operator.add without overwriting.
+    """
+    query = state.get("query", "")
+    logger.info(f"[WEB SEARCH WORKER] Searching Tavily for query: '{query}'")
+    
+    search_res = await execute_tavily_search(query, max_results=3)
+    results = search_res.get("results", [])
+
+    print(f"\n[WEB SEARCH WORKER COMPLETE] Query: '{query}' -> Found {len(results)} search results:")
+    for idx, r in enumerate(results, 1):
+        title = r.get("title", "")[:50]
+        url = r.get("url", "")
+        print(f"   - Result #{idx}: Title: '{title}...' | URL: {url}")
+    
+    return {"web_search_raw_results": [search_res]}
+
+
+class CriticEvaluation(BaseModel):
+    verified_facts: str = Field(description="Concise, de-duplicated essential facts synthesized from web results.")
+    citations: List[Dict[str, str]] = Field(description="List of dicts with 'title' and 'url' for sources used.")
+
+
+async def critic_agent(state: SupervisorState) -> Dict[str, Any]:
+    """
+    Critic Agent node: Aggregates parallel search results, de-duplicates content, adds citations,
+    and extracts minimal concise essential facts to send to supervisor_sales_agent.
+    """
+    raw_results = state.get("web_search_raw_results") or []
+    print("\n" + "=" * 80)
+    print(f"[CRITIC AGENT] Aggregating & verifying {len(raw_results)} parallel web search streams...")
+
+    formatted_docs = ""
+    idx = 1
+    for item in raw_results:
+        q = item.get("query", "")
+        results = item.get("results", [])
+        formatted_docs += f"\n--- Search Stream for Query: '{q}' ---\n"
+        for r in results:
+            formatted_docs += f"[{idx}] Title: {r.get('title')}\nURL: {r.get('url')}\nContent: {r.get('content')}\n\n"
+            idx += 1
+
+    critic_prompt = (
+        f"You are the Lead Critic & Fact Verification Agent for Vrsa Agrotech.\n"
+        f"Review the 3 parallel web search streams below.\n\n"
+        f"RULES:\n"
+        f"1. De-duplicate overlapping information across streams.\n"
+        f"2. Extract ONLY highly relevant, verified, minimal, concise essential facts.\n"
+        f"3. Include inline URL citations wherever external facts are asserted.\n\n"
+        f"DOCUMENT SEARCH STREAMS:\n{formatted_docs}"
+    )
+
+    try:
+        structured_critic = sub_agent_llm.with_structured_output(CriticEvaluation)
+        critic_res: CriticEvaluation = await structured_critic.ainvoke([SystemMessage(content=critic_prompt)])
+        verified_facts = critic_res.verified_facts
+        citations = critic_res.citations
+    except Exception as e:
+        logger.error(f"[CRITIC AGENT] Fact verification error: {e}")
+        verified_facts = formatted_docs[:1000]
+        citations = []
+
+    existing_facts = list(state.get("internal_facts") or [])
+    payload = {
+        "subagent": "critic_agent",
+        "verified_web_facts": verified_facts,
+        "citations": citations
+    }
+    existing_facts.append(payload)
+
+    print(f"[CRITIC AGENT SUMMARY] Synthesized verified facts with {len(citations)} citations:")
+    facts_snippet = verified_facts[:180].replace("\n", " ") + "..." if len(verified_facts) > 180 else verified_facts
+    print(f"   Verified Facts Snippet: {facts_snippet}")
+    for c in citations:
+        print(f"   Citation: [{c.get('title', '')}]({c.get('url', '')})")
+    
+    print("\n[CRITIC AGENT] Sent verified facts payload to Supervisor State -> Next: 'supervisor_sales_agent'")
+    print("=" * 80 + "\n")
+
+    return {
+        "internal_facts": existing_facts,
+        "next": "supervisor_sales_agent"
+    }
