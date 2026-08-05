@@ -408,7 +408,13 @@ async def chat_stream_endpoint(req: ChatRequest):
                     if token and isinstance(token, str):
                         yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
             elif kind in ["on_chat_model_end", "on_chain_end", "on_node_end"]:
-                if node_name == "web_search_fanout":
+                if node_name == "web_search_worker":
+                    output = event.get("data", {}).get("output")
+                    if isinstance(output, dict) and "web_search_worker_items" in output:
+                        items = output.get("web_search_worker_items", [])
+                        if items and isinstance(items, list):
+                            yield f"data: {json.dumps({'type': 'web_search_worker_results', 'results': items})}\n\n"
+                elif node_name == "web_search_fanout":
                     output = event.get("data", {}).get("output")
                     if isinstance(output, dict) and "web_search_queries" in output:
                         queries = output.get("web_search_queries", [])

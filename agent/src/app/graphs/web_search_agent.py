@@ -19,13 +19,13 @@ sub_agent_llm = ChatOpenAI(model=sub_agent_model, temperature=0.2, api_key=setti
 
 class QueryDecomposition(BaseModel):
     queries: List[str] = Field(
-        description="Exactly 3 distinct search queries expressing the user's core request from 3 different perspectives (e.g. 1. Direct factual, 2. Industry/scientific domain, 3. Practical market/use-case)."
+        description="3 to 5 distinct search queries expressing the user's request from different perspectives (max 5 queries)."
     )
 
 
 def web_search_fanout(state: SupervisorState):
     """
-    Decomposes the user query into 3 distinct search perspectives and uses Send() to execute 3 parallel web search worker nodes.
+    Decomposes the user query into up to 5 distinct search perspectives (max limit 5) and executes parallel web search workers.
     """
     messages = state.get("messages", [])
     last_user_query = ""
@@ -46,23 +46,24 @@ def web_search_fanout(state: SupervisorState):
     decomp_prompt = (
         f"You are a Search Query Architect for Vrsa Agrotech.\n"
         f"User query: '{last_user_query}'\n"
-        f"Generate exactly 3 distinct search query strings to query the web in parallel:\n"
+        f"Generate 3 to 5 distinct search query strings (maximum 5) to query the web in parallel:\n"
         f"1. Factual / Direct Query\n"
         f"2. Scientific / Technical Domain Query\n"
-        f"3. Practical Market / Farmer Use-case Query"
+        f"3. Practical Market / Farmer Use-case Query\n"
+        f"4. Innovation / Future Industry Query (if applicable)"
     )
 
     try:
         structured_llm = sub_agent_llm.with_structured_output(QueryDecomposition)
         res: QueryDecomposition = structured_llm.invoke([SystemMessage(content=decomp_prompt)])
-        queries = res.queries[:3]
+        queries = res.queries[:5]  # Hard limit max 5 queries
         if len(queries) < 3:
             queries.extend([last_user_query] * (3 - len(queries)))
     except Exception as e:
         logger.error(f"[WEB SEARCH AGENT] Query decomposition error: {e}")
         queries = [last_user_query, f"{last_user_query} research trends", f"{last_user_query} market price"]
 
-    print("[WEB SEARCH AGENT] STEP 2: 3 PARALLEL WORKER QUERIES GENERATED (Send()):")
+    print(f"[WEB SEARCH AGENT] STEP 2: {len(queries)} PARALLEL WORKER QUERIES GENERATED:")
     for idx, q in enumerate(queries, 1):
         print(f"   Worker #{idx}: '{q}'")
     print("=" * 80 + "\n")
@@ -73,12 +74,12 @@ def web_search_fanout(state: SupervisorState):
 def route_web_search_fanout(state: SupervisorState) -> List[Send]:
     """
     Conditional edge router exiting web_search_fanout node.
-    Spawns 3 parallel web_search_worker nodes using Send().
+    Spawns parallel web_search_worker nodes using Send().
     """
     queries = state.get("web_search_queries", [])
     if not queries:
         queries = ["latest AI technology 2026"]
-    return [Send("web_search_worker", {"query": q}) for q in queries]
+    return [Send("web_search_worker", {"query": q}) for q in queries[:5]]
 
 
 async def web_search_worker(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -93,12 +94,18 @@ async def web_search_worker(state: Dict[str, Any]) -> Dict[str, Any]:
     results = search_res.get("results", [])
 
     print(f"\n[WEB SEARCH WORKER COMPLETE] Query: '{query}' -> Found {len(results)} search results:")
+    worker_items = []
     for idx, r in enumerate(results, 1):
-        title = r.get("title", "")[:50]
+        title = r.get("title", "")
         url = r.get("url", "")
-        print(f"   - Result #{idx}: Title: '{title}...' | URL: {url}")
+        print(f"   - Result #{idx}: Title: '{title[:50]}...' | URL: {url}")
+        if title:
+            worker_items.append({"title": title, "url": url})
     
-    return {"web_search_raw_results": [search_res]}
+    return {
+        "web_search_raw_results": [search_res],
+        "web_search_worker_items": worker_items
+    }
 
 
 class CriticEvaluation(BaseModel):

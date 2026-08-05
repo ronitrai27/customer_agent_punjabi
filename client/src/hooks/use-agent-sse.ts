@@ -9,6 +9,7 @@ export interface Message {
   reasoning?: string;
   statusText?: string;
   searchQueries?: string[];
+  searchResults?: { title: string; url: string }[];
   duration?: number;
   approvalCard?: PendingApproval;
   memoryUpdated?: boolean;
@@ -122,6 +123,9 @@ export function useAgentSSE(threadId: string, userId: string) {
 
               if (data.type === "token") {
                 accumulatedText += data.content;
+                const cleanText = accumulatedText
+                  .replace(/<suggested_actions>[\s\S]*?(?:<\/suggested_actions>|$)/gi, "")
+                  .trim();
                 if (!durationRecorded) {
                   duration =
                     (Date.now() - (reasoningStartTime || startTime)) / 1000;
@@ -130,7 +134,7 @@ export function useAgentSSE(threadId: string, userId: string) {
                 setMessages((prev) =>
                   prev.map((msg) =>
                     msg.id === assistantMessageId
-                      ? { ...msg, content: accumulatedText, duration }
+                      ? { ...msg, content: cleanText, duration }
                       : msg,
                   ),
                 );
@@ -149,6 +153,21 @@ export function useAgentSSE(threadId: string, userId: string) {
                       ? { ...msg, searchQueries: data.queries }
                       : msg,
                   ),
+                );
+              } else if (data.type === "web_search_worker_results") {
+                setMessages((prev) =>
+                  prev.map((msg) => {
+                    if (msg.id !== assistantMessageId) return msg;
+                    const existing = msg.searchResults || [];
+                    const newItems: { title: string; url: string }[] = data.results || [];
+                    const combined = [...existing];
+                    for (const item of newItems) {
+                      if (item?.title && !combined.some((c) => c.title === item.title)) {
+                        combined.push(item);
+                      }
+                    }
+                    return { ...msg, searchResults: combined };
+                  }),
                 );
               } else if (data.type === "reasoning") {
                 if (!reasoningStartTime) {
@@ -202,12 +221,15 @@ export function useAgentSSE(threadId: string, userId: string) {
                   );
                   toastFired = true;
                 }
+                const cleanResponse = (data.response || "")
+                  .replace(/<suggested_actions>[\s\S]*?(?:<\/suggested_actions>|$)/gi, "")
+                  .trim();
                 setMessages((prev) =>
                   prev.map((msg) =>
                     msg.id === assistantMessageId
                       ? {
                           ...msg,
-                          content: data.response,
+                          content: cleanResponse,
                           duration,
                           suggestedActions: data.suggested_actions,
                         }
