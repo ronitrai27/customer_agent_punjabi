@@ -99,8 +99,17 @@ async def evaluate_live_chat_background(user_query: str, agent_reply: str, final
         scores = {}
         for metric in metrics_to_run:
             try:
-                # Measure metric asynchronously or in thread pool
-                await asyncio.to_thread(metric.measure, test_case)
+                # Force async_mode to False to prevent nested event loop deadlocks
+                metric.async_mode = False
+                
+                # Measure metric in thread without animated progress bar spinner
+                def measure_sync(m=metric, tc=test_case):
+                    try:
+                        return m.measure(tc, _show_indicator=False)
+                    except TypeError:
+                        return m.measure(tc)
+
+                await asyncio.to_thread(measure_sync)
                 metric_name = metric.__class__.__name__
                 scores[metric_name] = {
                     "score": round(metric.score, 4) if metric.score is not None else 0.0,
@@ -109,6 +118,7 @@ async def evaluate_live_chat_background(user_query: str, agent_reply: str, final
                 }
             except Exception as me:
                 logger.warning(f"Metric {metric.__class__.__name__} failed during live eval: {me}")
+
 
         print("\n" + "=" * 70)
         print(f" LIVE CHAT DEEPEVAL RESULTS [Query: '{user_query}']")

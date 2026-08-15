@@ -29,6 +29,7 @@ class Settings:
     UPSTASH_REDIS_URL: str = os.getenv("UPSTASH_REDIS_URL", "")
     JINA_API_KEY: str = os.getenv("JINA_API_KEY", "")
     DATABASE_URL: str = os.getenv("DATABASE_URL", "")
+    TAVILY_API_KEY: str = os.getenv("TAVILY_API_KEY", "")
 
 
 
