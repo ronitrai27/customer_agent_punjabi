@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -8,21 +9,36 @@ from src.app.api.endpoints.memory import router as memory_router
 from src.app.api.endpoints.evaluation import router as eval_router
 from src.app.services.llama_service import llama_service
 from src.app.services.pinecone_service import pinecone_service
+from src.app.services.embedding_service import embedding_service
 
-app = FastAPI(
-    title="Customer Ingestion Agent API",
-    description="Asynchronous ingestion pipeline & Vrsa Agrotech Supervisor Agent API.",
-    version="1.0.0",
-)
 
-@app.on_event("startup")
-def startup_event():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup actions
     try:
         from src.app.services.db_service import db_service
         db_service.ensure_chat_tables()
     except Exception as e:
         print(f"[Startup Warning] Could not initialize database tables: {e}")
-    print("server started ready to receive query !")
+
+    # Pre-load local embedding model into memory on startup
+    try:
+        embedding_service.preload_local_model()
+    except Exception as e:
+        print(f"[Startup Warning] Could not pre-load embedding model: {e}")
+
+    print("\n✅ SERVER STARTED & READY TO RECEIVE QUERIES!\n")
+    yield
+    # Shutdown actions if any
+
+
+app = FastAPI(
+    title="Customer Ingestion Agent API",
+    description="Asynchronous ingestion pipeline & Vrsa Agrotech Supervisor Agent API.",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
 
 # Configure CORS for Next.js client interaction across localhost and 127.0.0.1
 app.add_middleware(

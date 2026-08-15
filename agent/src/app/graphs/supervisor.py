@@ -38,29 +38,33 @@ query_llm = sub_agent_llm.bind_tools([create_query, get_user_queries])
 # -----------------------------------------------------------------------------
 # Router Decision Model
 # -----------------------------------------------------------------------------
+# Router Decision Model (Multi-Action Parallel Fan-Out Support)
+# -----------------------------------------------------------------------------
 class SupervisorDecision(BaseModel):
-    action_type: str = Field(
-        description="Next node to route to: 'RAG_SEARCH' (for questions about catalog products, milk yield, fat %, ingredients, dosage), 'BOOKING_NODE' (for ordering/booking products or checking booking history/updates), 'QUERY_NODE' (for creating support tickets/callbacks or checking user support tickets), 'DEEP_MEMORY' (when user asks about past history, memory, previous purchases, or stored cattle/farmer profile facts), 'WEB_SEARCH' (for external web queries, current milk/commodity market prices, dairy industry news, or general scientific studies outside internal catalog), or 'NONE' (greetings, standard chit-chat, general topics)."
+    actions: List[str] = Field(
+        description="List of sub-agent actions to trigger in parallel (can select 1 or multiple): 'RAG_SEARCH' (for catalog products, dosage, ingredients, milk fat %), 'BOOKING_NODE' (for placing orders or checking booking status), 'QUERY_NODE' (for support tickets/callbacks), 'DEEP_MEMORY' (for past user history, past queries, memory, or profile facts), 'WEB_SEARCH' (for market prices, external news, scientific studies outside catalog), or 'NONE' (greetings, general topics)."
     )
-    reasoning: str = Field(description="Reasoning for decision.")
+    reasoning: str = Field(description="Reasoning for routing decision.")
 
 
 ROUTER_PROMPT = """
 You are the Supervisor Decision Engine for Vrsa Agrotech (Animal Nutrition & Dairy Supplements).
 Catalog: Horsa-550X-Turbo, TrioSan Gold, MaxaPro-DS Dairy, MaxaPro Liquid, Buffalo-Power 2X, Buffalo-F 1.5X.
 
-Analyze the user's message and history to classify the next action:
-1. Product details/ingredients, dosage, animal species recommendation, milk fat yield -> action_type = "RAG_SEARCH" (routes to rag_agent)
-2. Place a product order/booking, check order/booking updates/history -> action_type = "BOOKING_NODE" (routes to booking_node)
-3. Create a support ticket/query/callback request, check existing support tickets -> action_type = "QUERY_NODE" (routes to query_node)
-4. User asks about their past interactions, past memory, stored farmer/cattle profile, previous recommendations, or order history -> action_type = "DEEP_MEMORY" (routes to deep_memory_node)
-5. General web queries, current raw milk or grain commodity prices, general livestock market news, or scientific studies outside internal catalog -> action_type = "WEB_SEARCH" (routes to web_search_fanout)
-6. Greetings, general chit-chat, or general sales discussion -> action_type = "NONE" (routes directly to sales agent)
+Analyze the user's message and context history to select ALL applicable actions to execute in parallel:
+1. Product details/ingredients, dosage, animal species recommendation, milk fat yield -> include "RAG_SEARCH"
+2. Place a product order/booking, check order/booking updates/history -> include "BOOKING_NODE"
+3. Create a support ticket/query/callback request, check existing support tickets -> include "QUERY_NODE"
+4. User asks about their past interactions, past queries, memory, stored farmer/cattle profile, previous recommendations -> include "DEEP_MEMORY"
+5. General web queries, current raw milk or grain commodity prices, general livestock market news, or scientific studies outside internal catalog -> include "WEB_SEARCH"
+6. Greetings, general chit-chat, or simple sales discussion -> include "NONE"
+
+If a user request contains multiple intents (e.g. asking about past queries AND product nutrition sources AND market prices), select ALL corresponding actions in the actions list so they can execute in parallel.
 """
 
 
 async def supervisor_router(state: SupervisorState) -> Dict[str, Any]:
-    """Decides if we route to RAG Sub-Agent, Booking Node, Query Node, Deep Memory Node, Web Search Fanout, or Supervisor Sales Agent."""
+    """Decides and triggers single or multiple sub-agents in parallel (RAG, Booking, Query, Deep Memory, Web Search)."""
     messages = state.get("messages", [])
 
     try:
@@ -79,22 +83,28 @@ async def supervisor_router(state: SupervisorState) -> Dict[str, Any]:
             primary_call, fallback_call, context_name="Supervisor Router"
         )
         
-        if decision.action_type == "RAG_SEARCH":
-            next_node = "rag_agent"
-        elif decision.action_type == "BOOKING_NODE":
-            next_node = "booking_node"
-        elif decision.action_type == "QUERY_NODE":
-            next_node = "query_node"
-        elif decision.action_type == "DEEP_MEMORY":
-            next_node = "deep_memory_node"
-        elif decision.action_type == "WEB_SEARCH":
-            next_node = "web_search_fanout"
-        else:
-            next_node = "supervisor_sales_agent"
+        raw_actions = decision.actions if isinstance(decision.actions, list) else [decision.actions]
+        next_nodes = []
+        for act in raw_actions:
+            if act == "RAG_SEARCH" and "rag_agent" not in next_nodes:
+                next_nodes.append("rag_agent")
+            elif act == "BOOKING_NODE" and "booking_node" not in next_nodes:
+                next_nodes.append("booking_node")
+            elif act == "QUERY_NODE" and "query_node" not in next_nodes:
+                next_nodes.append("query_node")
+            elif act == "DEEP_MEMORY" and "deep_memory_node" not in next_nodes:
+                next_nodes.append("deep_memory_node")
+            elif act == "WEB_SEARCH" and "web_search_fanout" not in next_nodes:
+                next_nodes.append("web_search_fanout")
+
+        if not next_nodes:
+            next_nodes = ["supervisor_sales_agent"]
+
+        logger.info(f"[SUPERVISOR ROUTER] Selected parallel sub-agents: {next_nodes} | Reasoning: {decision.reasoning}")
 
         return {
-            "next": next_node,
-            "action_type": decision.action_type
+            "next": next_nodes if len(next_nodes) > 1 else next_nodes[0],
+            "action_type": ", ".join(raw_actions)
         }
     except Exception as e:
         logger.error(f"Router error: {e}")
@@ -596,8 +606,11 @@ workflow.add_node("supervisor_sales_agent", supervisor_sales_agent)
 workflow.set_entry_point("supervisor_router")
 
 
-def route_next(state: SupervisorState) -> str:
-    return state.get("next", "supervisor_sales_agent")
+def route_next(state: SupervisorState) -> Any:
+    next_target = state.get("next", "supervisor_sales_agent")
+    if isinstance(next_target, list):
+        return next_target
+    return next_target
 
 
 workflow.add_conditional_edges("supervisor_router", route_next, {

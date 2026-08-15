@@ -15,18 +15,11 @@ from src.app.core.config import settings
 
 logger = logging.getLogger("EvalActivities")
 
-# LLM Judge setup for evaluation metrics
-openai_api_key = os.getenv("OPENAI_API_KEY", "").strip('"')
+# LLM Judge setup for evaluation metrics (Prioritizing Groq for zero OpenAI costs)
 groq_api_key = os.getenv("GROQ_API_KEY", "").strip('"')
+openai_api_key = os.getenv("OPENAI_API_KEY", "").strip('"')
 
-if openai_api_key:
-    llm_eval = ChatOpenAI(
-        model="gpt-4o-mini",
-        temperature=0.0,
-        api_key=openai_api_key,
-    )
-    use_json_mode = False
-elif groq_api_key:
+if groq_api_key:
     llm_eval = ChatOpenAI(
         model="llama-3.3-70b-versatile",
         temperature=0.0,
@@ -34,9 +27,17 @@ elif groq_api_key:
         base_url="https://api.groq.com/openai/v1",
     )
     use_json_mode = True
+elif openai_api_key:
+    llm_eval = ChatOpenAI(
+        model="gpt-4o-mini",
+        temperature=0.0,
+        api_key=openai_api_key,
+    )
+    use_json_mode = False
 else:
     llm_eval = ChatOpenAI(model="gpt-4o-mini", temperature=0.0)
     use_json_mode = False
+
 
 
 class FaithfulnessEvaluation(BaseModel):

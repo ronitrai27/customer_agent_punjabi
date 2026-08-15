@@ -41,6 +41,17 @@ class EmbeddingService:
                 raise e
         return self._local_model
 
+    def preload_local_model(self):
+        """
+        Pre-loads local SentenceTransformer model into memory on server startup.
+        """
+        try:
+            self._get_local_model()
+            logger.info("SentenceTransformer pre-loaded and ready for zero-latency fallback.")
+        except Exception as e:
+            logger.warning(f"Could not pre-load SentenceTransformer model: {e}")
+
+
     async def get_dense_embeddings(self, texts: List[str]) -> List[List[float]]:
         """
         Generates dense vector embeddings.

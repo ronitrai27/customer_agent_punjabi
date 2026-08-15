@@ -31,6 +31,52 @@ class TranslateRequest(BaseModel):
     text: str
 
 
+def print_console_execution_summary(
+    start_time: float,
+    user_query: str,
+    nodes_called: List[str],
+    tools_called: List[str],
+    final_state: Dict[str, Any],
+    clean_reply: str
+):
+    """Outputs structured, zero-latency console execution diagnostics and history trace."""
+    total_latency = round(time.time() - start_time, 2)
+    internal_facts = final_state.get("internal_facts", []) if final_state else []
+
+    print("\n" + "╔" + "═" * 78 + "╗", flush=True)
+    print(f"║ 📊 AGENT EXECUTION DIAGNOSTICS & METRICS SUMMARY", flush=True)
+    print("╠" + "═" * 78 + "╣", flush=True)
+    print(f"║ ⏱️  Total Request Latency: {total_latency} seconds", flush=True)
+    print(f"║ 👤 User Query: '{user_query}'", flush=True)
+    
+    unique_nodes = list(dict.fromkeys(nodes_called))
+    print(f"║ 🛠️  Graph Nodes Executed ({len(unique_nodes)}): {' ➔ '.join(unique_nodes)}", flush=True)
+    
+    if tools_called:
+        unique_tools = list(dict.fromkeys(tools_called))
+        print(f"║ 🧰  Tools Executed ({len(unique_tools)}): {', '.join(unique_tools)}", flush=True)
+    
+    print(f"║ 📚 Internal Facts Aggregated: {len(internal_facts)} fact item(s)", flush=True)
+    for idx, fact in enumerate(internal_facts, 1):
+        if not isinstance(fact, dict):
+            continue
+        subagent = fact.get("subagent", "unknown")
+        if "reranked_chunks" in fact:
+            print(f"║    [{idx}] RAG Subagent ('rag_agent'): {len(fact['reranked_chunks'])} retrieved catalog chunks", flush=True)
+        elif subagent == "deep_memory_node":
+            rel_len = len(fact.get("relevant_facts", []))
+            print(f"║    [{idx}] Deep Memory Node ('deep_memory_node'): {rel_len} vector memory snippets", flush=True)
+        elif subagent == "critic_agent":
+            cits = len(fact.get("citations", []))
+            print(f"║    [{idx}] Critic Agent ('critic_agent'): Web search verified ({cits} citations)", flush=True)
+        else:
+            print(f"║    [{idx}] Subagent ('{subagent}')", flush=True)
+
+    print(f"║ 💬 Response Generated: {len(clean_reply)} characters", flush=True)
+    print("╚" + "═" * 78 + "╝\n", flush=True)
+
+
+
 @router.post("/translate")
 async def translate_endpoint(req: TranslateRequest):
     if not req.text or not req.text.strip():
@@ -332,11 +378,12 @@ async def chat_stream_endpoint(req: ChatRequest):
         }
     }
     
+    nodes_called_order = []
+    tools_called_order = []
+
     async def process_stream_events(stream_iterator):
         reasoning_sent = False
         last_status = ""
-        logged_nodes = set()
-        logged_tools = set()
 
         async for event in stream_iterator:
             kind = event.get("event")
@@ -346,8 +393,8 @@ async def chat_stream_endpoint(req: ChatRequest):
 
             # Emit real-time status updates & console logs as graph nodes & subagents begin
             if kind in ["on_chain_start", "on_node_start"]:
-                if node_name and node_name not in logged_nodes:
-                    logged_nodes.add(node_name)
+                if node_name and node_name not in nodes_called_order:
+                    nodes_called_order.append(node_name)
                     logger.info(f"👉 AGENT CALLED: {node_name}")
                     print(f"\n==========================================", flush=True)
                     print(f"👉 AGENT CALLED: {node_name}", flush=True)
@@ -380,8 +427,8 @@ async def chat_stream_endpoint(req: ChatRequest):
 
             if kind == "on_tool_start":
                 tool_name = event.get("name", "")
-                if tool_name and tool_name not in logged_tools:
-                    logged_tools.add(tool_name)
+                if tool_name and tool_name not in tools_called_order:
+                    tools_called_order.append(tool_name)
                     logger.info(f"🛠️ TOOL CALLED: {tool_name}")
                     print(f"🛠️ TOOL CALLED: {tool_name}", flush=True)
                     yield f"data: {json.dumps({'type': 'tool_call', 'tool': tool_name, 'content': f'{tool_name} called'})}\n\n"
@@ -432,6 +479,7 @@ async def chat_stream_endpoint(req: ChatRequest):
                 yield f"data: {json.dumps({'type': 'tool_success', 'tool': event.get('name')})}\n\n"
     
     async def event_generator():
+        start_time = time.time()
         cb = get_langfuse_callback()
         if cb:
             config["callbacks"] = [cb]
@@ -575,6 +623,16 @@ async def chat_stream_endpoint(req: ChatRequest):
                         req.user_id, req.message, clean_reply, dense_vec=rag_dense_vec
                     )
 
+                # Print structured, zero-latency console diagnostics summary
+                print_console_execution_summary(
+                    start_time=start_time,
+                    user_query=req.message,
+                    nodes_called=nodes_called_order,
+                    tools_called=tools_called_order,
+                    final_state=new_state.values,
+                    clean_reply=clean_reply
+                )
+
                 # Trigger background memory check if message count is a multiple of 3
                 await trigger_background_memory_workflow(req.user_id, req.thread_id)
                 
@@ -589,6 +647,7 @@ async def chat_stream_endpoint(req: ChatRequest):
                     "thread_id": req.thread_id
                 }
                 yield f"data: {json.dumps(payload)}\n\n"
+
                       
         except Exception as e:
             logger.error(f"Streaming endpoint error: {e}", exc_info=True)
