@@ -21,7 +21,7 @@ openai_api_key = os.getenv("OPENAI_API_KEY", "").strip('"')
 
 if groq_api_key:
     llm_eval = ChatOpenAI(
-        model="llama-3.3-70b-versatile",
+        model="qwen/qwen3.6-27b",
         temperature=0.0,
         api_key=groq_api_key,
         base_url="https://api.groq.com/openai/v1",

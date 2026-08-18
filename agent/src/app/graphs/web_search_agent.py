@@ -40,9 +40,6 @@ def web_search_fanout(state: SupervisorState):
     if not last_user_query:
         last_user_query = "latest dairy farming and livestock market trends"
 
-    print("\n" + "=" * 80)
-    print(f"[WEB SEARCH AGENT] STEP 1: EXTRACTED USER QUERY -> '{last_user_query}'")
-
     decomp_prompt = (
         f"You are a Search Query Architect for Vrsa Agrotech.\n"
         f"User query: '{last_user_query}'\n"
@@ -54,7 +51,7 @@ def web_search_fanout(state: SupervisorState):
     )
 
     try:
-        structured_llm = sub_agent_llm.with_structured_output(QueryDecomposition)
+        structured_llm = sub_agent_llm.with_structured_output(QueryDecomposition, method="function_calling")
         res: QueryDecomposition = structured_llm.invoke([SystemMessage(content=decomp_prompt)])
         queries = res.queries[:5]  # Hard limit max 5 queries
         if len(queries) < 3:
@@ -62,11 +59,6 @@ def web_search_fanout(state: SupervisorState):
     except Exception as e:
         logger.error(f"[WEB SEARCH AGENT] Query decomposition error: {e}")
         queries = [last_user_query, f"{last_user_query} research trends", f"{last_user_query} market price"]
-
-    print(f"[WEB SEARCH AGENT] STEP 2: {len(queries)} PARALLEL WORKER QUERIES GENERATED:")
-    for idx, q in enumerate(queries, 1):
-        print(f"   Worker #{idx}: '{q}'")
-    print("=" * 80 + "\n")
 
     return {"web_search_queries": queries}
 
@@ -93,12 +85,10 @@ async def web_search_worker(state: Dict[str, Any]) -> Dict[str, Any]:
     search_res = await execute_tavily_search(query, max_results=3)
     results = search_res.get("results", [])
 
-    print(f"\n[WEB SEARCH WORKER COMPLETE] Query: '{query}' -> Found {len(results)} search results:")
     worker_items = []
     for idx, r in enumerate(results, 1):
         title = r.get("title", "")
         url = r.get("url", "")
-        print(f"   - Result #{idx}: Title: '{title[:50]}...' | URL: {url}")
         if title:
             worker_items.append({"title": title, "url": url})
     
@@ -108,9 +98,14 @@ async def web_search_worker(state: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+class CitationItem(BaseModel):
+    title: str = Field(default="", description="Title of the web source.")
+    url: str = Field(default="", description="URL of the web source.")
+
+
 class CriticEvaluation(BaseModel):
     verified_facts: str = Field(description="Concise, de-duplicated essential facts synthesized from web results.")
-    citations: List[Dict[str, str]] = Field(description="List of dicts with 'title' and 'url' for sources used.")
+    citations: List[CitationItem] = Field(default_factory=list, description="List of source citations used.")
 
 
 async def critic_agent(state: SupervisorState) -> Dict[str, Any]:
@@ -119,9 +114,6 @@ async def critic_agent(state: SupervisorState) -> Dict[str, Any]:
     and extracts minimal concise essential facts to send to supervisor_sales_agent.
     """
     raw_results = state.get("web_search_raw_results") or []
-    print("\n" + "=" * 80)
-    print(f"[CRITIC AGENT] Aggregating & verifying {len(raw_results)} parallel web search streams...")
-
     formatted_docs = ""
     idx = 1
     for item in raw_results:
@@ -143,10 +135,10 @@ async def critic_agent(state: SupervisorState) -> Dict[str, Any]:
     )
 
     try:
-        structured_critic = sub_agent_llm.with_structured_output(CriticEvaluation)
+        structured_critic = sub_agent_llm.with_structured_output(CriticEvaluation, method="function_calling")
         critic_res: CriticEvaluation = await structured_critic.ainvoke([SystemMessage(content=critic_prompt)])
         verified_facts = critic_res.verified_facts
-        citations = critic_res.citations
+        citations = [{"title": c.title, "url": c.url} for c in critic_res.citations]
     except Exception as e:
         logger.error(f"[CRITIC AGENT] Fact verification error: {e}")
         verified_facts = formatted_docs[:1000]
@@ -159,15 +151,6 @@ async def critic_agent(state: SupervisorState) -> Dict[str, Any]:
         "citations": citations
     }
     existing_facts.append(payload)
-
-    print(f"[CRITIC AGENT SUMMARY] Synthesized verified facts with {len(citations)} citations:")
-    facts_snippet = verified_facts[:180].replace("\n", " ") + "..." if len(verified_facts) > 180 else verified_facts
-    print(f"   Verified Facts Snippet: {facts_snippet}")
-    for c in citations:
-        print(f"   Citation: [{c.get('title', '')}]({c.get('url', '')})")
-    
-    print("\n[CRITIC AGENT] Sent verified facts payload to Supervisor State -> Next: 'supervisor_sales_agent'")
-    print("=" * 80 + "\n")
 
     return {
         "internal_facts": existing_facts,

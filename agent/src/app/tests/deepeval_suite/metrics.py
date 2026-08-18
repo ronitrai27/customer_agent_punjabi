@@ -11,30 +11,56 @@ from langchain_openai import ChatOpenAI
 
 
 class GroqDeepEvalLLM(DeepEvalBaseLLM):
-    """Custom DeepEval LLM wrapper enforcing Groq-only models (llama-3.3-70b-versatile) for zero OpenAI cost evals."""
+    """Custom DeepEval LLM wrapper enforcing high-intelligence Qwen models (qwen/qwen3.6-27b) with OpenAI fallback."""
 
-    def __init__(self, model_name="llama-3.3-70b-versatile"):
+    def __init__(self, model_name="qwen/qwen3.6-27b"):
         self.model_name = model_name
         groq_key = os.getenv("GROQ_API_KEY", "").strip('"')
-        if not groq_key:
-            raise ValueError("GROQ_API_KEY must be set in environment for Groq evaluations.")
-        self.model = ChatOpenAI(
-            model=self.model_name,
-            api_key=groq_key,
-            base_url="https://api.groq.com/openai/v1",
-            temperature=0.0
-        )
+        openai_key = os.getenv("OPENAI_API_KEY", "").strip('"')
+
+        if groq_key:
+            self.model = ChatOpenAI(
+                model=self.model_name,
+                api_key=groq_key,
+                base_url="https://api.groq.com/openai/v1",
+                temperature=0.0
+            )
+        elif openai_key:
+            self.model_name = "gpt-4o-mini"
+            self.model = ChatOpenAI(
+                model="gpt-4o-mini",
+                api_key=openai_key,
+                temperature=0.0
+            )
+        else:
+            raise ValueError("Neither GROQ_API_KEY nor OPENAI_API_KEY is configured.")
 
     def load_model(self):
         return self.model
 
     def generate(self, prompt: str) -> str:
-        res = self.model.invoke(prompt)
-        return res.content if hasattr(res, "content") else str(res)
+        try:
+            res = self.model.invoke(prompt)
+            return res.content if hasattr(res, "content") else str(res)
+        except Exception as e:
+            openai_key = os.getenv("OPENAI_API_KEY", "").strip('"')
+            if openai_key:
+                fallback = ChatOpenAI(model="gpt-4o-mini", api_key=openai_key, temperature=0.0)
+                res = fallback.invoke(prompt)
+                return res.content if hasattr(res, "content") else str(res)
+            raise e
 
     async def a_generate(self, prompt: str) -> str:
-        res = await self.model.ainvoke(prompt)
-        return res.content if hasattr(res, "content") else str(res)
+        try:
+            res = await self.model.ainvoke(prompt)
+            return res.content if hasattr(res, "content") else str(res)
+        except Exception as e:
+            openai_key = os.getenv("OPENAI_API_KEY", "").strip('"')
+            if openai_key:
+                fallback = ChatOpenAI(model="gpt-4o-mini", api_key=openai_key, temperature=0.0)
+                res = await fallback.ainvoke(prompt)
+                return res.content if hasattr(res, "content") else str(res)
+            raise e
 
     def get_model_name(self):
         return self.model_name

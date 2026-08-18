@@ -42,9 +42,7 @@ def mask_pii(text: str) -> str:
     text = re.sub(r'\b[a-zA-Z]{4,5}\d{4,7}[a-zA-Z]?\b', "[REDACTED_PAN_CARD]", text, flags=re.IGNORECASE)
 
     if text != original_text:
-        print(f"\n[GUARDRAIL CONSOLE LOG - LAYER 1 PII DETECTED & REDACTED]:")
-        print(f"  Original:  {original_text}")
-        print(f"  Sanitized: {text}\n")
+        logger.info(f"Guardrail PII Redacted: '{original_text}' -> '{text}'")
 
     return text
 
@@ -74,9 +72,7 @@ def validate_layer1_regex(user_input: str) -> Tuple[bool, str, Optional[str]]:
     text_lower = sanitized.lower()
     for pattern in fast_attack_patterns:
         if re.search(pattern, text_lower):
-            print(f"\n[GUARDRAIL CONSOLE LOG - LAYER 1 ATTACK BLOCKED]:")
-            print(f"  Reason:     Pattern Attack Signature Detected ('{pattern}')")
-            print(f"  User Input: {user_input}\n")
+            logger.warning(f"Guardrail Attack Blocked (Pattern: '{pattern}')")
             refusal = "I cannot process this request because it violates safety policies and security rules."
             return False, sanitized, refusal
 
@@ -97,12 +93,12 @@ class SafetyEvaluation(BaseModel):
 
 
 def _get_judge_llm():
-    """Initializes high-speed Groq LLM (llama-3.3-70b-versatile) for Stage 2 Guardrail."""
+    """Initializes high-speed Groq Safeguard LLM (openai/gpt-oss-safeguard-20b) for Stage 2B Guardrail."""
     groq_key = os.getenv("GROQ_API_KEY", "").strip('"')
     if groq_key:
         try:
             return ChatOpenAI(
-                model="llama-3.3-70b-versatile",
+                model="openai/gpt-oss-safeguard-20b",
                 api_key=groq_key,
                 base_url="https://api.groq.com/openai/v1",
                 temperature=0.0
@@ -112,7 +108,7 @@ def _get_judge_llm():
     
     openai_key = os.getenv("OPENAI_API_KEY", "").strip('"')
     return ChatOpenAI(
-        model="gpt-4.1-mini",
+        model="gpt-4o-mini",
         api_key=openai_key,
         temperature=0.0
     )
@@ -120,15 +116,40 @@ def _get_judge_llm():
 
 async def validate_layer2_groq_llm(user_input: str) -> Tuple[bool, str, Optional[str]]:
     """
-    Stage 2 Guardrail: Ultra-fast Groq LLM Semantic Safety Judge.
-    Evaluates intent against security rules: harmful content, hacking/jailbreaks, admin social engineering, and human medical advice.
-    All animal/livestock/pet nutrition, feeds, protein sources, and product queries are SAFE and ALLOWED.
+    Stage 2 Guardrail (2-Tier Ultra-Fast Guardrail):
+    - Tier 2A (~250ms): Fast prompt-injection scoring via meta-llama/llama-prompt-guard-2-86m.
+    - Tier 2B (~360ms): Full semantic safety judge via openai/gpt-oss-safeguard-20b.
     """
     if not user_input or not user_input.strip():
         return True, user_input, None
 
-    print(f"\n[GUARDRAIL CONSOLE LOG - STAGE 2 GROQ LLM EVALUATING]: '{user_input[:80]}...'")
+    # Tier 2A: Ultra-Fast Prompt Guard Scoring (~250ms)
+    groq_key = os.getenv("GROQ_API_KEY", "").strip('"')
+    if groq_key:
+        try:
+            import httpx
+            headers = {"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"}
+            payload = {
+                "model": "meta-llama/llama-prompt-guard-2-86m",
+                "messages": [{"role": "user", "content": user_input}],
+                "max_tokens": 10
+            }
+            async with httpx.AsyncClient(timeout=3.0) as client:
+                res = await client.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload)
+                if res.status_code == 200:
+                    text = res.json()["choices"][0]["message"]["content"].strip()
+                    try:
+                        score = float(text)
+                        if score > 0.8:
+                            logger.warning(f"Guardrail Tier 2A Prompt Guard High Risk (score: {score:.4f})")
+                            refusal = "I cannot process this request because it violates safety policies and security rules."
+                            return False, user_input, refusal
+                    except ValueError:
+                        pass
+        except Exception as pge:
+            logger.debug(f"Prompt Guard 2A error ({pge}). Proceeding to Tier 2B...")
 
+    # Tier 2B: Full Semantic Safety Judge (openai/gpt-oss-safeguard-20b)
     judge_prompt = (
         "You are the Security & Safety Guardrail Judge for Vrsa Agrotech, an agricultural and livestock AI assistant.\n"
         "Your sole task is to semantically evaluate if the user query is malicious/unsafe or safe to process.\n\n"
@@ -152,17 +173,25 @@ async def validate_layer2_groq_llm(user_input: str) -> Tuple[bool, str, Optional
         eval_res: SafetyEvaluation = await structured_judge.ainvoke([SystemMessage(content=judge_prompt)])
 
         if not eval_res.is_safe:
-            print(f"\n[GUARDRAIL CONSOLE LOG - STAGE 2 GROQ BLOCKED]:")
-            print(f"  Category: {eval_res.violation_category}")
-            print(f"  Refusal:  {eval_res.refusal_reason}\n")
+            logger.warning(f"Guardrail Groq Blocked: {eval_res.violation_category}")
             refusal = eval_res.refusal_reason or "I cannot process this request because it violates safety policies and security rules."
             return False, user_input, refusal
 
-        print(f"[GUARDRAIL CONSOLE LOG - STAGE 2 PASSED]: Query is safe.\n")
         return True, user_input, None
 
     except Exception as e:
-        logger.error(f"Stage 2 Groq Guardrail error ({e}). Defaulting to safe pass with Layer 1 protection.")
+        logger.warning(f"Stage 2 Guardrail Groq error ({e}). Executing OpenAI fallback...")
+        try:
+            openai_key = os.getenv("OPENAI_API_KEY", "").strip('"')
+            if openai_key:
+                fallback_llm = ChatOpenAI(model="gpt-4o-mini", api_key=openai_key, temperature=0.0)
+                structured_judge = fallback_llm.with_structured_output(SafetyEvaluation)
+                eval_res: SafetyEvaluation = await structured_judge.ainvoke([SystemMessage(content=judge_prompt)])
+                if not eval_res.is_safe:
+                    refusal = eval_res.refusal_reason or "I cannot process this request because it violates safety policies and security rules."
+                    return False, user_input, refusal
+        except Exception as oe:
+            logger.error(f"Guardrail fallback error ({oe}). Defaulting to safe pass with Layer 1 protection.")
         return True, user_input, None
 
 
@@ -195,8 +224,6 @@ class AgentGuardrailService:
         Runs Stage 1 (Fast Regex) -> Stage 2 (Groq LLM Semantic Safety Judge).
         Returns: Tuple[is_safe (bool), sanitized_input (str), refusal_message (str | None)]
         """
-        print(f"\n[GUARDRAIL CONSOLE LOG - INCOMING REQUEST]: {user_input}")
-
         # Stage 1: Fast Regex & PII Masking (~0ms)
         is_safe_l1, sanitized, refusal_l1 = validate_layer1_regex(user_input)
         if not is_safe_l1:
@@ -207,7 +234,6 @@ class AgentGuardrailService:
         if not is_safe_l2:
             return False, sanitized, refusal_l2
 
-        print(f"[GUARDRAIL CONSOLE LOG - PASSED BOTH INPUT FILTERS]: Proceeding to cache & agent graph...\n")
         return True, sanitized, None
 
     async def validate_output(self, bot_output: str) -> Tuple[bool, str]:

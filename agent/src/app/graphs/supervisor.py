@@ -69,13 +69,13 @@ async def supervisor_router(state: SupervisorState) -> Dict[str, Any]:
 
     try:
         async def primary_call():
-            structured_llm = llm.with_structured_output(SupervisorDecision)
+            structured_llm = llm.with_structured_output(SupervisorDecision, method="function_calling")
             return await structured_llm.ainvoke([SystemMessage(content=ROUTER_PROMPT)] + messages)
 
         async def fallback_call():
             fallback_llm = llm_circuit_breaker.get_fallback_llm()
             if fallback_llm:
-                fallback_structured = fallback_llm.with_structured_output(SupervisorDecision)
+                fallback_structured = fallback_llm.with_structured_output(SupervisorDecision, method="function_calling")
                 return await fallback_structured.ainvoke([SystemMessage(content=ROUTER_PROMPT)] + messages)
             return await primary_call()
 
