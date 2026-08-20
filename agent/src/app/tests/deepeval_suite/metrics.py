@@ -11,29 +11,29 @@ from langchain_openai import ChatOpenAI
 
 
 class GroqDeepEvalLLM(DeepEvalBaseLLM):
-    """Custom DeepEval LLM wrapper enforcing high-intelligence Qwen models (qwen/qwen3.6-27b) with OpenAI fallback."""
+    """Custom DeepEval LLM wrapper enforcing OpenAI (gpt-4o-mini) for 100% reliable evaluation JSON structure with Groq fallback."""
 
-    def __init__(self, model_name="qwen/qwen3.6-27b"):
-        self.model_name = model_name
-        groq_key = os.getenv("GROQ_API_KEY", "").strip('"')
+    def __init__(self, model_name="gpt-4o-mini"):
+        self.model_name = os.getenv("DEEPEVAL_MODEL", model_name)
         openai_key = os.getenv("OPENAI_API_KEY", "").strip('"')
+        groq_key = os.getenv("GROQ_API_KEY", "").strip('"')
 
-        if groq_key:
+        if openai_key:
+            self.model = ChatOpenAI(
+                model=self.model_name,
+                api_key=openai_key,
+                temperature=0.0
+            )
+        elif groq_key:
+            self.model_name = "qwen/qwen3.6-27b"
             self.model = ChatOpenAI(
                 model=self.model_name,
                 api_key=groq_key,
                 base_url="https://api.groq.com/openai/v1",
                 temperature=0.0
             )
-        elif openai_key:
-            self.model_name = "gpt-4o-mini"
-            self.model = ChatOpenAI(
-                model="gpt-4o-mini",
-                api_key=openai_key,
-                temperature=0.0
-            )
         else:
-            raise ValueError("Neither GROQ_API_KEY nor OPENAI_API_KEY is configured.")
+            raise ValueError("Neither OPENAI_API_KEY nor GROQ_API_KEY is configured.")
 
     def load_model(self):
         return self.model

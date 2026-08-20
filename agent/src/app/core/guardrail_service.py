@@ -234,6 +234,8 @@ class AgentGuardrailService:
         if not is_safe_l2:
             return False, sanitized, refusal_l2
 
+        print(f"\033[92m[PASSED GUARDRAIL] PASSED user query: '{sanitized}'\033[0m", flush=True)
+        logger.info(f"PASSED user query: '{sanitized}'")
         return True, sanitized, None
 
     async def validate_output(self, bot_output: str) -> Tuple[bool, str]:
