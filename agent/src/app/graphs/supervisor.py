@@ -22,11 +22,28 @@ from src.app.core.circuit_breaker import llm_circuit_breaker
 
 logger = logging.getLogger("SupervisorAgent")
 
-model_name = os.getenv("SUPERVISOR_MODEL", "gpt-4.1-mini")
-sub_agent_model = "gpt-4.1-mini"
+# (Commented out - replaced gpt-4.1-mini router with ultra-fast Groq model)
+# model_name = os.getenv("SUPERVISOR_MODEL", "gpt-4.1-mini")
+# llm = ChatOpenAI(model=model_name, temperature=0.3, api_key=settings.OPENAI_API_KEY)
 
-# Supervisor main routing model 
-llm = ChatOpenAI(model=model_name, temperature=0.3, api_key=settings.OPENAI_API_KEY)
+# Supervisor main routing model using Groq (openai/gpt-oss-20b) for ms latency
+groq_router_model = os.getenv("GROQ_ROUTER_MODEL", getattr(settings, "GROQ_ROUTER_MODEL", "openai/gpt-oss-20b"))
+groq_key = getattr(settings, "GROQ_API_KEY", os.getenv("GROQ_API_KEY", "")).strip('"')
+
+if groq_key:
+    logger.info(f"[Supervisor] Initializing Groq router with model: {groq_router_model}")
+    llm = ChatOpenAI(
+        model=groq_router_model,
+        temperature=0.0,
+        api_key=groq_key,
+        base_url="https://api.groq.com/openai/v1"
+    )
+else:
+    logger.warning("[Supervisor] GROQ_API_KEY not found. Falling back to OpenAI router model.")
+    model_name = os.getenv("SUPERVISOR_MODEL", "gpt-4.1-mini")
+    llm = ChatOpenAI(model=model_name, temperature=0.3, api_key=settings.OPENAI_API_KEY)
+
+sub_agent_model = "gpt-4.1-mini"
 # Sub-agent model (gpt-4.1-mini)
 sub_agent_llm = ChatOpenAI(model=sub_agent_model, temperature=0.2, api_key=settings.OPENAI_API_KEY)
 
@@ -69,13 +86,13 @@ async def supervisor_router(state: SupervisorState) -> Dict[str, Any]:
 
     try:
         async def primary_call():
-            structured_llm = llm.with_structured_output(SupervisorDecision)
+            structured_llm = llm.with_structured_output(SupervisorDecision, method="function_calling")
             return await structured_llm.ainvoke([SystemMessage(content=ROUTER_PROMPT)] + messages)
 
         async def fallback_call():
             fallback_llm = llm_circuit_breaker.get_fallback_llm()
             if fallback_llm:
-                fallback_structured = fallback_llm.with_structured_output(SupervisorDecision)
+                fallback_structured = fallback_llm.with_structured_output(SupervisorDecision, method="function_calling")
                 return await fallback_structured.ainvoke([SystemMessage(content=ROUTER_PROMPT)] + messages)
             return await primary_call()
 

@@ -14,20 +14,13 @@ import asyncio
 import logging
 from typing import Any, Dict, List
 
-from deepeval.test_case import LLMTestCase, ToolCall
-from src.app.tests.deepeval_suite.metrics import (
-    faithfulness_metric,
-    answer_relevancy_metric,
-    contextual_precision_metric,
-    contextual_recall_metric,
-    tool_correctness_metric,
-)
-
 logger = logging.getLogger("DeepEvalServerEvaluator")
 
 
 def extract_eval_data_from_state(user_query: str, agent_reply: str, final_state: Dict[str, Any]) -> Dict[str, Any]:
     """Extracts retrieved contexts and tool calls from LangGraph state."""
+    from deepeval.test_case import ToolCall
+
     retrieved_contexts = []
     tools_called = []
 
@@ -44,9 +37,9 @@ def extract_eval_data_from_state(user_query: str, agent_reply: str, final_state:
                 elif isinstance(chunk, dict) and "text" in chunk:
                     retrieved_contexts.append(chunk["text"])
 
-        # Extract subagent tool calls
+        # Extract subagent tool calls (deduplicated by subagent name)
         subagent_name = item.get("subagent")
-        if subagent_name:
+        if subagent_name and subagent_name not in [t.name for t in tools_called]:
             tools_called.append(
                 ToolCall(
                     name=subagent_name,
@@ -68,6 +61,15 @@ async def evaluate_live_chat_background(user_query: str, agent_reply: str, final
     Does not block the user response.
     """
     try:
+        from deepeval.test_case import LLMTestCase
+        from src.app.tests.deepeval_suite.metrics import (
+            faithfulness_metric,
+            answer_relevancy_metric,
+            contextual_precision_metric,
+            contextual_recall_metric,
+            tool_correctness_metric,
+        )
+
         data = extract_eval_data_from_state(user_query, agent_reply, final_state)
         
         # Build DeepEval LLMTestCase for live chat
