@@ -72,7 +72,7 @@ export function useAgentSSE(threadId: string, userId: string) {
           id: assistantMessageId,
           role: "assistant",
           content: "",
-          statusText: "Checking query & checking semantic cache...",
+          statusText: "Thinking...",
           timestamp: new Date().toLocaleTimeString([], {
             hour: "2-digit",
             minute: "2-digit",

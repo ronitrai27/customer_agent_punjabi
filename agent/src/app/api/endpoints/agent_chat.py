@@ -524,7 +524,7 @@ async def chat_stream_endpoint(req: ChatRequest, request: Request):
             config["callbacks"] = [cb]
 
         try:
-            yield f"data: {json.dumps({'type': 'status', 'content': 'Checking query & checking semantic cache...'})}\n\n"
+            yield f"data: {json.dumps({'type': 'status', 'content': 'Thinking...'})}\n\n"
 
             # 1. Fetch current state of the conversation thread
             state = await agent_graph.aget_state(config)
@@ -540,7 +540,7 @@ async def chat_stream_endpoint(req: ChatRequest, request: Request):
                     logger.info(
                         f"User approved pending action for thread {req.thread_id}. Resuming..."
                     )
-                    await save_user_message(req.thread_id, req.user_id, "Yes, confirm.")
+                    asyncio.create_task(save_user_message(req.thread_id, req.user_id, "Yes, confirm."))
                     async for chunk in process_stream_events(
                         agent_graph.astream_events(None, config, version="v2")
                     ):
@@ -550,7 +550,7 @@ async def chat_stream_endpoint(req: ChatRequest, request: Request):
                     logger.info(
                         f"User rejected pending action for thread {req.thread_id}. Cancelling and resuming..."
                     )
-                    await save_user_message(req.thread_id, req.user_id, "No, cancel.")
+                    asyncio.create_task(save_user_message(req.thread_id, req.user_id, "No, cancel."))
                     await agent_graph.aupdate_state(
                         config, {"pending_action_details": None}
                     )
@@ -564,13 +564,19 @@ async def chat_stream_endpoint(req: ChatRequest, request: Request):
                     yield f"data: {json.dumps({'type': 'error', 'error': 'Message cannot be empty.'})}\n\n"
                     return
 
-                # NeMo Guardrails Input Validation & PII Redaction
+                # PARALLEL PRE-GRAPH EXECUTION: Fire Guardrails, Cache Check & Profile Fetch concurrently!
                 guardrail_svc = AgentGuardrailService.get_instance()
-                (
-                    is_safe,
-                    sanitized_input,
-                    refusal_reason,
-                ) = await guardrail_svc.validate_input(req.message)
+                
+                guardrail_task = asyncio.create_task(guardrail_svc.validate_input(req.message))
+                cache_task = asyncio.create_task(semantic_cache_service.get_cached_response(req.user_id, req.message))
+                profile_task = asyncio.create_task(get_slim_user_profile(req.user_id))
+
+                # Fire DB message save in background (non-blocking, 0ms wait for user)
+                asyncio.create_task(save_user_message(req.thread_id, req.user_id, req.message))
+
+                # Await Guardrail & Cache check concurrently
+                (is_safe, sanitized_input, refusal_reason) = await guardrail_task
+                cached_data = await cache_task
 
                 if not is_safe:
                     logger.warning(
@@ -580,8 +586,7 @@ async def chat_stream_endpoint(req: ChatRequest, request: Request):
                         refusal_reason
                         or "I cannot process this request because it violates safety policies and security rules."
                     )
-                    await save_user_message(req.thread_id, req.user_id, req.message)
-                    await save_assistant_message(req.thread_id, refusal_text)
+                    asyncio.create_task(save_assistant_message(req.thread_id, refusal_text))
 
                     yield f"data: {json.dumps({'type': 'error', 'error': refusal_text})}\n\n"
                     yield f"data: {json.dumps({'type': 'token', 'content': refusal_text})}\n\n"
@@ -597,15 +602,8 @@ async def chat_stream_endpoint(req: ChatRequest, request: Request):
 
                 user_message_to_process = sanitized_input
 
-                # Fast check in Semantic Cache
-                cached_data = await semantic_cache_service.get_cached_response(
-                    req.user_id, user_message_to_process
-                )
                 if cached_data:
-                    await save_user_message(
-                        req.thread_id, req.user_id, user_message_to_process
-                    )
-                    await save_assistant_message(req.thread_id, cached_data["response"])
+                    asyncio.create_task(save_assistant_message(req.thread_id, cached_data["response"]))
                     yield f"data: {json.dumps({'type': 'reasoning', 'content': 'Retrieved instantly from 7-day Semantic Cache.'})}\n\n"
                     yield f"data: {json.dumps({'type': 'token', 'content': cached_data['response']})}\n\n"
                     payload = {
@@ -618,10 +616,8 @@ async def chat_stream_endpoint(req: ChatRequest, request: Request):
                     yield f"data: {json.dumps(payload)}\n\n"
                     return
 
-                await save_user_message(req.thread_id, req.user_id, user_message_to_process)
-
-                # Fetch slim, lightweight user core memory context
-                user_profile = await get_slim_user_profile(req.user_id)
+                # Await user profile memory (which was already running in parallel!)
+                user_profile = await profile_task
 
                 initial_state = {
                     "messages": [HumanMessage(content=user_message_to_process)],
@@ -632,7 +628,7 @@ async def chat_stream_endpoint(req: ChatRequest, request: Request):
                     "pending_action_details": None,
                 }
 
-                yield f"data: {json.dumps({'type': 'status', 'content': 'Initializing conversation & starting agent graph...'})}\n\n"
+                yield f"data: {json.dumps({'type': 'status', 'content': 'Analyzing intent & generating response...'})}\n\n"
                 async for chunk in process_stream_events(
                     agent_graph.astream_events(initial_state, config, version="v2")
                 ):

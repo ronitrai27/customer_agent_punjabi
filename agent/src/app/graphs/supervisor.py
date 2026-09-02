@@ -570,8 +570,23 @@ async def supervisor_sales_agent(state: SupervisorState) -> Dict[str, Any]:
         if facts_str:
             system_content += f"\n\n--- INTERNAL DATA FACTS ---\n{facts_str}"
 
+    action_type = state.get("action_type", "NONE")
+
+    # Dynamic Model Switcher: Use Groq (llm) for simple chit-chat/greetings (NONE & no facts) for ~200ms latency,
+    # and OpenAI gpt-4.1-mini (sub_agent_llm) for complex domain synthesis (RAG, web search, tools).
+    if action_type == "NONE" and not facts:
+        target_sales_llm = llm
+        model_name_log = getattr(target_sales_llm, "model", "groq")
+        print(f"[SALES AGENT] LLM SELECTED: GROQ ({model_name_log}) [CHIT-CHAT GREETING]", flush=True)
+        logger.info(f"[Supervisor Sales Agent] Routing to fast Groq model ({model_name_log}) for chit-chat greeting.")
+    else:
+        target_sales_llm = sub_agent_llm
+        model_name_log = getattr(target_sales_llm, "model", "gpt-4.1-mini")
+        print(f"[SALES AGENT] LLM SELECTED: OPENAI ({model_name_log}) [DOMAIN TASK]", flush=True)
+        logger.info(f"[Supervisor Sales Agent] Routing to OpenAI model ({model_name_log}) for complex domain response.")
+
     async def primary_sales_call():
-        return await sub_agent_llm.ainvoke([SystemMessage(content=system_content)] + messages)
+        return await target_sales_llm.ainvoke([SystemMessage(content=system_content)] + messages)
 
     async def fallback_sales_call():
         fallback_llm = llm_circuit_breaker.get_fallback_llm()

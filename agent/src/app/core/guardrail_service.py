@@ -229,6 +229,13 @@ class AgentGuardrailService:
         if not is_safe_l1:
             return False, sanitized, refusal_l1
 
+        # Fast Pass: Skip expensive Layer 2 LLM Guardrails for short, clean queries (<= 5 words)
+        clean_words = re.sub(r"[^\w\s]", "", sanitized.lower()).split()
+        if len(clean_words) <= 5 and is_safe_l1:
+            print(f"\033[92m[PASSED GUARDRAIL] FAST PASS (short query): '{sanitized}'\033[0m", flush=True)
+            logger.info(f"PASSED user query (FAST PASS): '{sanitized}'")
+            return True, sanitized, None
+
         # Stage 2: Groq LLM Semantic Safety Judge (~100ms)
         is_safe_l2, _, refusal_l2 = await validate_layer2_groq_llm(sanitized)
         if not is_safe_l2:
